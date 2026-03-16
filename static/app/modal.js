@@ -71,6 +71,12 @@ function showProviderManagerModal(data) {
                         <button class="btn btn-secondary" onclick="window.refreshUnhealthyUuids('${providerType}')" data-i18n="modal.provider.refreshUnhealthyUuids" title="刷新不健康节点的UUID">
                             <i class="fas fa-sync-alt"></i> <span data-i18n="modal.provider.refreshUnhealthyUuidsBtn">刷新UUID</span>
                         </button>
+                        <button class="btn btn-primary" onclick="window.refreshAllUuids('${providerType}')" data-i18n="modal.provider.refreshAllUuids" title="刷新所有节点的UUID">
+                            <i class="fas fa-sync-alt"></i> <span data-i18n="modal.provider.refreshAllUuidsBtn">刷新全部UUID</span>
+                        </button>
+                        <button class="btn btn-warning" onclick="window.checkCredentialsUnlink('${providerType}')" data-i18n="modal.provider.checkCredentialsUnlink" title="检测凭证错误并自动取消关联">
+                            <i class="fas fa-shield-alt"></i> <span data-i18n="modal.provider.checkCredentialsUnlinkBtn">检测凭证</span>
+                        </button>
                         <button class="btn btn-danger" onclick="window.deleteUnhealthyProviders('${providerType}')" data-i18n="modal.provider.deleteUnhealthy" title="删除不健康节点">
                             <i class="fas fa-trash-alt"></i> <span data-i18n="modal.provider.deleteUnhealthyBtn">删除不健康</span>
                         </button>
@@ -1564,6 +1570,100 @@ async function refreshUnhealthyUuids(providerType) {
     }
 }
 
+
+/**
+ * 批量刷新所有节点的UUID
+ * @param {string} providerType - 提供商类型
+ */
+async function refreshAllUuids(providerType) {
+    const totalCount = currentProviders.length;
+
+    if (totalCount === 0) {
+        showToast(t('common.info'), t('modal.provider.refreshAllUuids.noProviders'), 'info');
+        return;
+    }
+
+    if (!confirm(t('modal.provider.refreshAllUuidsConfirm', { type: providerType, count: totalCount }))) {
+        return;
+    }
+
+    try {
+        showToast(t('common.info'), t('modal.provider.refreshAllUuids.refreshing'), 'info');
+
+        const response = await window.apiClient.post(
+            `/providers/${encodeURIComponent(providerType)}/refresh-all-uuids`
+        );
+
+        if (response.success) {
+            showToast(
+                t('common.success'),
+                t('modal.provider.refreshAllUuids.success', { count: response.refreshedCount }),
+                'success'
+            );
+
+            // 重新加载配置
+            await window.apiClient.post('/reload-config');
+
+            // 刷新提供商配置显示
+            await refreshProviderConfig(providerType);
+        } else {
+            showToast(t('common.error'), t('modal.provider.refreshAllUuids.failed'), 'error');
+        }
+    } catch (error) {
+        console.error('刷新全部UUID失败:', error);
+        showToast(t('common.error'), t('modal.provider.refreshAllUuids.failed') + ': ' + error.message, 'error');
+    }
+}
+
+/**
+ * 检测凭证并自动取消关联
+ * @param {string} providerType - 提供商类型
+ */
+async function checkCredentialsUnlink(providerType) {
+    const totalCount = currentProviders.length;
+
+    if (totalCount === 0) {
+        showToast(t('common.info'), t('modal.provider.checkCredentialsUnlink.noProviders'), 'info');
+        return;
+    }
+
+    if (!confirm(t('modal.provider.checkCredentialsUnlinkConfirm', { type: providerType, count: totalCount }))) {
+        return;
+    }
+
+    try {
+        showToast(t('common.info'), t('modal.provider.checkCredentialsUnlink.checking'), 'info');
+
+        const response = await window.apiClient.post(
+            `/providers/${encodeURIComponent(providerType)}/check-credentials-unlink`,
+            {}
+        );
+
+        if (response.success) {
+            const { successCount, failCount, unlinkedCount } = response;
+            const message = t('modal.provider.checkCredentialsUnlink.complete', {
+                success: successCount,
+                fail: failCount,
+                unlinked: unlinkedCount
+            });
+            const level = (failCount > 0 || unlinkedCount > 0) ? 'warning' : 'success';
+
+            showToast(t('common.info'), message, level);
+
+            // 重新加载配置
+            await window.apiClient.post('/reload-config');
+
+            // 刷新提供商配置显示
+            await refreshProviderConfig(providerType);
+        } else {
+            showToast(t('common.error'), t('modal.provider.checkCredentialsUnlink.failed'), 'error');
+        }
+    } catch (error) {
+        console.error('检测凭证失败:', error);
+        showToast(t('common.error'), t('modal.provider.checkCredentialsUnlink.failed') + ': ' + error.message, 'error');
+    }
+}
+
 /**
  * 渲染不支持的模型选择器（不调用API，直接使用传入的模型列表）
  * @param {string} uuid - 提供商UUID
@@ -1617,6 +1717,8 @@ export {
     performHealthCheck,
     deleteUnhealthyProviders,
     refreshUnhealthyUuids,
+    refreshAllUuids,
+    checkCredentialsUnlink,
     loadModelsForProviderType,
     renderNotSupportedModelsSelector,
     goToProviderPage,
@@ -1637,5 +1739,7 @@ window.resetAllProvidersHealth = resetAllProvidersHealth;
 window.performHealthCheck = performHealthCheck;
 window.deleteUnhealthyProviders = deleteUnhealthyProviders;
 window.refreshUnhealthyUuids = refreshUnhealthyUuids;
+window.refreshAllUuids = refreshAllUuids;
+window.checkCredentialsUnlink = checkCredentialsUnlink;
 window.goToProviderPage = goToProviderPage;
 window.refreshProviderUuid = refreshProviderUuid;

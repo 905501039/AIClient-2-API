@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import logger from '../utils/logger.js';
 import { getRequestBody } from '../utils/common.js';
 import { getAllProviderModels, getProviderModels } from '../providers/provider-models.js';
-import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual } from '../utils/provider-utils.js';
+import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual, PROVIDER_MAPPINGS } from '../utils/provider-utils.js';
 import { broadcastEvent } from './event-broadcast.js';
 import { getRegisteredProviders } from '../providers/adapter.js';
 
@@ -656,6 +656,231 @@ export async function handleRefreshUnhealthyUuids(req, res, currentConfig, provi
         return true;
     } catch (error) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: error.message } }));
+        return true;
+    }
+}
+
+/**
+ * 批量刷新特定提供商类型的所有节点的 UUID
+ */
+export async function handleRefreshAllUuids(req, res, currentConfig, providerPoolManager, providerType) {
+    try {
+        const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || "configs/provider_pools.json";
+        let providerPools = {};
+        
+        // Load existing pools
+        if (existsSync(filePath)) {
+            try {
+                const fileContent = readFileSync(filePath, "utf-8");
+                providerPools = JSON.parse(fileContent);
+            } catch (readError) {
+                res.writeHead(404, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: { message: "Provider pools file not found" } }));
+                return true;
+            }
+        }
+
+        const providers = providerPools[providerType] || [];
+        if (providers.length === 0) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "No providers found for this type" } }));
+            return true;
+        }
+
+        const refreshedProviders = [];
+        for (const provider of providers) {
+            const oldUuid = provider.uuid;
+            const newUuid = generateUUID();
+            provider.uuid = newUuid;
+            refreshedProviders.push({
+                oldUuid,
+                newUuid,
+                customName: provider.customName
+            });
+        }
+
+        // Save to file
+        writeFileSync(filePath, JSON.stringify(providerPools, null, 2), "utf-8");
+        logger.info(`[UI API] Refreshed UUIDs for ${refreshedProviders.length} providers in ${providerType}`);
+
+        // Update provider pool manager if available
+        if (providerPoolManager) {
+            providerPoolManager.providerPools = providerPools;
+            providerPoolManager.initializeProviderStatus();
+        }
+
+        // 广播更新事件
+        broadcastEvent("config_update", {
+            action: "refresh_all_uuids",
+            filePath: filePath,
+            providerType,
+            refreshedCount: refreshedProviders.length,
+            refreshedProviders,
+            timestamp: new Date().toISOString()
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+            success: true,
+            message: `Successfully refreshed UUIDs for ${refreshedProviders.length} providers`,
+            refreshedCount: refreshedProviders.length,
+            totalCount: providers.length,
+            refreshedProviders
+        }));
+        return true;
+    } catch (error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: error.message } }));
+        return true;
+    }
+}
+
+/**
+ * 执行凭证健康检测，发现错误则取消关联
+ */
+export async function handleCheckCredentialsAndUnlink(req, res, currentConfig, providerPoolManager, providerType) {
+    try {
+        if (!providerPoolManager) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Provider pool manager not initialized" } }));
+            return true;
+        }
+
+        const providers = providerPoolManager.providerStatus[providerType] || [];
+        if (providers.length === 0) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "No providers found for this type" } }));
+            return true;
+        }
+
+        const mapping = PROVIDER_MAPPINGS.find(m => m.providerType === providerType) || null;
+        const credPathKey = mapping ? mapping.credPathKey : null;
+
+        if (!credPathKey) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Credential path key not found for this provider type" } }));
+            return true;
+        }
+
+        const results = [];
+        for (const providerStatus of providers) {
+            const providerConfig = providerStatus.config;
+
+            if (providerConfig.isDisabled) {
+                continue;
+            }
+
+            try {
+                const healthResult = await providerPoolManager._checkProviderHealth(providerType, providerConfig, true);
+
+                if (healthResult === null) {
+                    results.push({
+                        uuid: providerConfig.uuid,
+                        success: null,
+                        message: "Health check not supported for this provider type"
+                    });
+                    continue;
+                }
+
+                if (healthResult.success) {
+                    providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName);
+                    results.push({
+                        uuid: providerConfig.uuid,
+                        success: true,
+                        modelName: healthResult.modelName,
+                        message: "Healthy"
+                    });
+                } else {
+                    const errorMessage = healthResult.errorMessage || "Check failed";
+                    const isAuthError = /\b(401|403)\b/.test(errorMessage) ||
+                        /\b(Unauthorized|Forbidden|AccessDenied|InvalidToken|ExpiredToken)\b/i.test(errorMessage);
+
+                    if (isAuthError) {
+                        providerConfig[credPathKey] = "";
+                        providerPoolManager.markProviderUnhealthyImmediately(providerType, providerConfig, errorMessage);
+                        logger.info(`[UI API] Auth error detected for ${providerConfig.uuid}, unlinked credential`);
+                    } else {
+                        providerPoolManager.markProviderUnhealthy(providerType, providerConfig, errorMessage);
+                    }
+
+                    providerConfig.lastHealthCheckTime = new Date().toISOString();
+                    if (healthResult.modelName) {
+                        providerConfig.lastHealthCheckModel = healthResult.modelName;
+                    }
+
+                    results.push({
+                        uuid: providerConfig.uuid,
+                        success: false,
+                        modelName: healthResult.modelName,
+                        message: errorMessage,
+                        isAuthError: isAuthError,
+                        unlinked: isAuthError
+                    });
+                }
+            } catch (error) {
+                const errorMessage = error.message || "Unknown error";
+                const isAuthError = /\b(401|403)\b/.test(errorMessage) ||
+                    /\b(Unauthorized|Forbidden|AccessDenied|InvalidToken|ExpiredToken)\b/i.test(errorMessage);
+
+                if (isAuthError) {
+                    providerConfig[credPathKey] = "";
+                    providerPoolManager.markProviderUnhealthyImmediately(providerType, providerConfig, errorMessage);
+                    logger.info(`[UI API] Auth error detected for ${providerConfig.uuid}, unlinked credential`);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(providerType, providerConfig, errorMessage);
+                }
+
+                results.push({
+                    uuid: providerConfig.uuid,
+                    success: false,
+                    message: errorMessage,
+                    isAuthError: isAuthError,
+                    unlinked: isAuthError
+                });
+            }
+        }
+
+        // 保存更新后的状态到文件
+        const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || "configs/provider_pools.json";
+        const providerPools = {};
+        for (const pType in providerPoolManager.providerStatus) {
+            providerPools[pType] = providerPoolManager.providerStatus[pType].map(ps => ps.config);
+        }
+        writeFileSync(filePath, JSON.stringify(providerPools, null, 2), "utf-8");
+
+        if (providerPoolManager) {
+            providerPoolManager.providerPools = providerPools;
+            providerPoolManager.initializeProviderStatus();
+        }
+
+        const successCount = results.filter(r => r.success === true).length;
+        const failCount = results.filter(r => r.success === false).length;
+        const unlinkedCount = results.filter(r => r.unlinked).length;
+
+        broadcastEvent("config_update", {
+            action: "check_credentials_unlink",
+            filePath: filePath,
+            providerType,
+            results,
+            unlinkedCount,
+            timestamp: new Date().toISOString()
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+            success: true,
+            message: `Credential check completed: ${successCount} healthy, ${failCount} failed, ${unlinkedCount} unlinked`,
+            successCount,
+            failCount,
+            unlinkedCount,
+            totalCount: providers.length,
+            results
+        }));
+        return true;
+    } catch (error) {
+        logger.error("[UI API] Credential check error:", error);
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: error.message } }));
         return true;
     }

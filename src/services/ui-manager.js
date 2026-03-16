@@ -184,6 +184,22 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         return await providerApi.handleRefreshUnhealthyUuids(req, res, currentConfig, providerPoolManager, providerType);
     }
 
+    // Refresh UUIDs for all providers of a specific type
+    // NOTE: This must be before the generic /{providerType}/{uuid} route to avoid matching 'refresh-all-uuids' as UUID
+    const refreshAllUuidsMatch = pathParam.match(/^\/api\/providers\/([^\/]+)\/refresh-all-uuids$/);
+    if (method === 'POST' && refreshAllUuidsMatch) {
+        const providerType = decodeURIComponent(refreshAllUuidsMatch[1]);
+        return await providerApi.handleRefreshAllUuids(req, res, currentConfig, providerPoolManager, providerType);
+    }
+
+    // Check credentials and unlink invalid providers for a specific type
+    // NOTE: This must be before the generic /{providerType}/{uuid} route to avoid matching 'check-credentials-unlink' as UUID
+    const checkCredsUnlinkMatch = pathParam.match(/^\/api\/providers\/([^\/]+)\/check-credentials-unlink$/);
+    if (method === 'POST' && checkCredsUnlinkMatch) {
+        const providerType = decodeURIComponent(checkCredsUnlinkMatch[1]);
+        return await providerApi.handleCheckCredentialsAndUnlink(req, res, currentConfig, providerPoolManager, providerType);
+    }
+
     // Disable/Enable specific provider configuration
     const disableEnableProviderMatch = pathParam.match(/^\/api\/providers\/([^\/]+)\/([^\/]+)\/(disable|enable)$/);
     if (disableEnableProviderMatch) {
